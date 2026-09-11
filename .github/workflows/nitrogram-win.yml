@@ -1,0 +1,177 @@
+name: Build Nitrogram Desktop (Windows x64)
+
+# Telegram Desktop builds every third-party library from source - Qt, FFmpeg,
+# OpenSSL and dozens more. Upstream's CI finishes in under an hour only because
+# its caches are warm; a cold run is hours of library building. So this workflow
+# has two modes: prime the caches once, then build the app quickly from then on.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What to do"
+        required: true
+        default: "build"
+        type: choice
+        options:
+          - build
+          - cache-only
+      configuration:
+        description: "CMake configuration"
+        required: false
+        default: "Release"
+        type: choice
+        options:
+          - Release
+          - Debug
+
+concurrency:
+  group: nitrogram-win-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 350
+    permissions:
+      contents: write
+
+    env:
+      PREPARE_PATH: "Telegram/build/prepare/prepare.py"
+      QT: "qt6"
+      ARCH: "x64"
+
+    defaults:
+      run:
+        shell: cmd
+
+    steps:
+      - name: Prepare directories.
+        run: |
+          mkdir %userprofile%\TBuild\Libraries
+          mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
+          echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
+          echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
+
+      - name: Get repository name.
+        shell: bash
+        run: echo "REPO_NAME=${GITHUB_REPOSITORY##*/}" >> $GITHUB_ENV
+
+      - name: Clone.
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          path: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
+
+      - name: First set up.
+        shell: bash
+        run: |
+          DOCPATH=$TBUILD/$REPO_NAME/docs/building-win.md
+          SDK="$(grep "SDK version" $DOCPATH | sed -r 's/.*\*\*(.*)\*\* SDK version.*/\1/')"
+          echo "SDK=$SDK" >> $GITHUB_ENV
+          echo "Using Windows SDK $SDK"
+
+          # Upstream drops /Zi from the debug flags; keep the same treatment so
+          # the prebuilt libraries match what tdesktop expects.
+          sed -i '/CMAKE_${lang}_FLAGS_DEBUG_INIT/s/${_Zi}//' "$PROGRAMFILES"/CMake/share/cmake*/Modules/Platform/Windows-MSVC.cmake
+
+          echo "$(sha256sum $TBUILD/$REPO_NAME/$PREPARE_PATH | awk '{ print $1 }')" >> CACHE_KEY.txt
+          echo "$SDK" >> CACHE_KEY.txt
+          echo "CACHE_KEY=$(sha256sum CACHE_KEY.txt | awk '{ print $1 }')" >> $GITHUB_ENV
+
+          git config --global user.email "you@example.com"
+          git config --global user.name "Sample"
+
+      - uses: Eden-CI/msvc-dev-cmd@master
+        name: Native Tools Command Prompt.
+        with:
+          arch: x64
+          sdk: ${{ env.SDK }}
+          toolset: '14.44'
+
+      - name: NuGet sources.
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+
+      - name: ThirdParty cache.
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: ${{ runner.OS }}-${{ runner.arch }}-third-party-${{ env.CACHE_KEY }}
+          restore-keys: ${{ runner.OS }}-${{ runner.arch }}-third-party-
+
+      - name: Libraries cache.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ runner.OS }}-x64-libs-v2-${{ env.CACHE_KEY }}
+          restore-keys: ${{ runner.OS }}-x64-libs-v2-
+
+      - name: Qt cache.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ runner.OS }}-x64-${{ env.QT }}-${{ env.CACHE_KEY }}
+          restore-keys: ${{ runner.OS }}-x64-${{ env.QT }}-
+
+      - name: Libraries.
+        run: |
+          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat skip-release silent %QT%
+
+      - name: Free up some disk space.
+        shell: bash
+        run: find $LibrariesPath '(' '(' ! '(' -name '*.lib' -o -name '*.a' -o -name '*.exe' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -name '*.pc' -o -path '*/include/*' -o -path '*/objects-*' -o -path '*/cache_keys/*' -o -path '*/patches/*' -o -path '*/nv-codec-headers/*' ')' -type f ')' -o -empty ')' -delete
+
+      - name: Nitrogram Desktop build.
+        if: inputs.mode == 'build'
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          cd %TBUILD%\%REPO_NAME%\Telegram
+
+          call configure.bat ^
+          %QT% ^
+          -D TDESKTOP_API_ID=%TELEGRAM_API_ID% ^
+          -D TDESKTOP_API_HASH=%TELEGRAM_API_HASH% ^
+          -D CMAKE_CONFIGURATION_TYPES=${{ inputs.configuration || 'Release' }} ^
+          -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON ^
+          -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
+
+          cmake --build ..\out --config ${{ inputs.configuration || 'Release' }} --parallel
+
+      - name: Collect artifact.
+        if: inputs.mode == 'build'
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$TBUILD/$REPO_NAME/out/${{ inputs.configuration || 'Release' }}"
+          mkdir -p artifact
+          if [ ! -f "$OUT/Telegram.exe" ]; then
+            echo "::error::Telegram.exe was not produced"
+            ls -la "$OUT" 2>/dev/null | head -40 || echo "(output directory missing)"
+            exit 1
+          fi
+          cp "$OUT/Telegram.exe" artifact/Nitrogram.exe
+          # Updater.exe only exists when autoupdate is compiled in; this build
+          # disables it, so its absence is expected rather than a failure.
+          [ -f "$OUT/Updater.exe" ] && cp "$OUT/Updater.exe" artifact/ || true
+          ls -lh artifact
+
+      - name: Upload artifact.
+        if: inputs.mode == 'build'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nitrogram-Desktop-Windows-x64
+          path: artifact\
+          if-no-files-found: error
+          retention-days: 30
