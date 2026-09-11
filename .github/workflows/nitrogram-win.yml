@@ -139,7 +139,9 @@ jobs:
         run: |
           cd %TBUILD%\%REPO_NAME%\Telegram
 
-          call configure.bat ^
+          REM x64 is required: without it configure targets x86 and then cannot
+          REM find the Qt that was built into Libraries\win64.
+          call configure.bat x64 ^
           %QT% ^
           -D TDESKTOP_API_ID=%TELEGRAM_API_ID% ^
           -D TDESKTOP_API_HASH=%TELEGRAM_API_HASH% ^
